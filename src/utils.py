@@ -5,12 +5,15 @@ import logging
 import csv
 import re
 
-def setup_logging(log_path: Path) -> None:
+def setup_logging(log_path: Path) -> logging.Logger:
     """
     Configure logging for the application.
     
     Args:
         log_path: Path where log file should be created
+    
+    Returns:
+        Configured logger instance
     
     Raises:
         PermissionError: If log file cannot be created or written to
@@ -19,15 +22,25 @@ def setup_logging(log_path: Path) -> None:
         # Ensure parent directory exists
         log_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Configure logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_path, encoding='utf-8'),
-                logging.StreamHandler()
-            ]
-        )
+        # Create logger
+        logger = logging.getLogger('file_deduplication')
+        logger.setLevel(logging.INFO)
+        
+        # Create handlers
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        stream_handler = logging.StreamHandler()
+        
+        # Create formatter
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        stream_handler.setFormatter(formatter)
+        
+        # Add handlers to logger
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        
+        return logger
+        
     except (OSError, PermissionError) as e:
         raise PermissionError(f"Cannot create or write to log file: {e}")
 
