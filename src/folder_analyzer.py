@@ -1,8 +1,28 @@
+"""Core analysis for the Synology duplicate-file report.
+
+The analysis is a two-phase pipeline:
+
+1. :meth:`FolderAnalyzer.analyze_folder_groups` groups duplicate files by the
+   *exact* set of full directory paths that share them. Each duplicate
+   ``group_id`` therefore belongs to exactly one :class:`FolderGroup`.
+2. :meth:`FolderAnalyzer.compact_nested_folders` is a second pass that merges
+   groups whose folders are nested within one another (e.g. a share and a
+   sub-folder of it), collapsing each relationship to its top-most level.
+
+Callers that want fully compacted results should run phase 2 on the output of
+phase 1.
+"""
 from dataclasses import dataclass
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set, Optional
 from pathlib import Path
 import csv
+import logging
 from collections import defaultdict
+
+try:
+    from src.utils import parse_csv_line, containing_directory
+except ImportError:  # pragma: no cover - fallback when run from within src/
+    from utils import parse_csv_line, containing_directory
 
 @dataclass
 class DuplicateFile:
@@ -23,49 +43,80 @@ class FolderGroup:
 class FolderAnalyzer:
     """Analyzes duplicate files to find folder relationships."""
     
-    def __init__(self, min_group_size: int = 50_000_000):
-        """Initialize analyzer with minimum group size threshold."""
+    def __init__(self, min_group_size: int = 50_000_000,
+                 logger: Optional[logging.Logger] = None):
+        """Initialize analyzer with minimum group size threshold.
+
+        Args:
+            min_group_size: Minimum reclaimable (wasted) space in bytes for a
+                folder group to be reported (default 50MB).
+            logger: Optional logger; malformed rows are logged here.
+        """
         self.min_group_size = min_group_size
+        self.logger = logger or logging.getLogger(__name__)
 
     def read_duplicate_report(self, csv_path: Path) -> List[DuplicateFile]:
-        """Read and parse the duplicate files report CSV."""
+        """Read and parse the duplicate files report CSV.
+
+        Uses ``utils.parse_csv_line`` as the single parsing path and stores the
+        full containing directory of each file in ``DuplicateFile.folder``.
+        Malformed rows are logged and skipped so a single bad row never aborts
+        the run. A missing or mismatched header is a structural error and
+        raises ``ValueError``.
+        """
         if not csv_path.exists():
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-        duplicate_files = []
-        
         with open(csv_path, 'r', encoding='utf-8', newline='') as f:
-            reader = csv.reader(f)
-            
-            # Validate header
-            header = next(reader, None)
-            expected_header = ["Group", "Shared Folder", "File", "Size(Byte)", "Modified Time"]
-            if header != expected_header:
-                raise ValueError(f"Invalid CSV header. Expected: {expected_header}")
-            
-            # Process rows
-            for row in reader:
-                if len(row) != 5:
-                    raise ValueError(f"Invalid row format: {row}")
-                
-                group_id, shared_folder, file_path, size_str, _ = row
-                
-                try:
-                    size = int(size_str)
-                except ValueError:
-                    raise ValueError(f"Invalid size value: {size_str}")
-                
-                duplicate_files.append(DuplicateFile(
-                    group_id=group_id,
-                    folder=shared_folder,
-                    path=file_path,
-                    size=size
-                ))
-        
+            lines = f.read().splitlines()
+
+        if not lines:
+            raise ValueError("Invalid CSV: file is empty (missing header)")
+
+        expected_header = ["Group", "Shared Folder", "File", "Size(Byte)", "Modified Time"]
+        header = next(csv.reader([lines[0]]), None)
+        if header != expected_header:
+            raise ValueError(f"Invalid CSV header. Expected: {expected_header}")
+
+        duplicate_files: List[DuplicateFile] = []
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            try:
+                group_id, _shared_folder, file_path, size, _modified = parse_csv_line(line)
+                folder = containing_directory(file_path)
+            except ValueError as exc:
+                self.logger.error("Skipping malformed CSV row %r: %s", line, exc)
+                continue
+
+            duplicate_files.append(DuplicateFile(
+                group_id=group_id,
+                folder=folder,
+                path=file_path,
+                size=size,
+            ))
+
         return duplicate_files
 
     def analyze_folder_groups(self, files: List[DuplicateFile]) -> List[FolderGroup]:
-        """Analyze duplicate files to identify folder groups with shared content."""
+        """Group duplicate files by the exact set of folders that share them.
+
+        Phase 1 of the pipeline. Files are first bucketed by ``group_id`` (a
+        Synology duplicate set). For every set that spans more than one folder,
+        the participating folders form a key and the group is attributed to it.
+        As a result each ``group_id`` belongs to exactly one
+        :class:`FolderGroup` (an invariant relied upon by
+        :meth:`compact_nested_folders`).
+
+        Only groups whose ``wasted_space`` meets ``min_group_size`` are kept,
+        and results are sorted by ``wasted_space`` descending.
+
+        Args:
+            files: Duplicate files parsed from the report.
+
+        Returns:
+            Folder groups sorted by reclaimable space (descending).
+        """
         # Group files by their duplicate group ID
         groups_by_id: Dict[str, List[DuplicateFile]] = defaultdict(list)
         for file in files:
@@ -99,21 +150,36 @@ class FolderAnalyzer:
                 for group_files in shared_files.values()
             )
             
-            # Only include groups meeting size threshold
-            if total_shared_size >= self.min_group_size:
+            # Only include groups meeting the reclaimable-space threshold
+            if wasted_space >= self.min_group_size:
                 results.append(FolderGroup(
                     folders=set(folders),
                     shared_files=dict(shared_files),
                     total_shared_size=total_shared_size,
                     wasted_space=wasted_space
                 ))
-        
-        # Sort by total shared size
-        results.sort(key=lambda x: x.total_shared_size, reverse=True)
+
+        # Sort by reclaimable (wasted) space, descending
+        results.sort(key=lambda x: x.wasted_space, reverse=True)
         return results
 
     def compact_nested_folders(self, groups: List[FolderGroup]) -> List[FolderGroup]:
-        """Combine groups where folders are nested within each other."""
+        """Combine groups whose folders are nested within one another.
+
+        When a child folder (e.g. ``/volume1/photos/vacation``) is nested under
+        a parent folder (e.g. ``/volume1/photos``) participating in the same
+        sharing relationship, the child is collapsed into the parent so each
+        relationship is reported once at the highest meaningful level.
+
+        Does not mutate the input list; returns a new list sorted by
+        ``wasted_space`` (descending).
+
+        Precondition:
+            Sizes are combined additively, which assumes each ``group_id``
+            appears in at most one input group (as produced by
+            :meth:`analyze_folder_groups`). Shared-file lists are still merged
+            per ``group_id`` so folder membership stays correct.
+        """
         if not groups:
             return []
 
@@ -129,46 +195,58 @@ class FolderAnalyzer:
                         return True
             return False
 
-        # Keep merging until no more merges are possible
+        def collapse(folders: Set[str]) -> Set[str]:
+            """Keep only the top-most ancestors, dropping nested children."""
+            return {
+                folder for folder in folders
+                if not any(
+                    other != folder and folder.startswith(other + '/')
+                    for other in folders
+                )
+            }
+
+        # Work on deep-ish copies so the caller's list and groups are untouched.
+        working: List[FolderGroup] = [
+            FolderGroup(
+                folders=set(group.folders),
+                shared_files={gid: list(files) for gid, files in group.shared_files.items()},
+                total_shared_size=group.total_shared_size,
+                wasted_space=group.wasted_space,
+            )
+            for group in groups
+        ]
+
+        # Keep merging until no more merges are possible.
         while True:
             merged = False
-            for i in range(len(groups)):
-                if merged:
-                    break
-                    
-                for j in range(i + 1, len(groups)):
-                    if should_merge(groups[i], groups[j]):
-                        # Merge groups[j] into groups[i]
-                        merged_folders = groups[i].folders.union(groups[j].folders)
-                        merged_files = {**groups[i].shared_files}
-                        
-                        # Merge shared files
-                        for group_id, files in groups[j].shared_files.items():
+            for i in range(len(working)):
+                for j in range(i + 1, len(working)):
+                    if should_merge(working[i], working[j]):
+                        first, second = working[i], working[j]
+
+                        # Merge shared files without double-counting a group_id.
+                        merged_files = {
+                            gid: list(files) for gid, files in first.shared_files.items()
+                        }
+                        for group_id, files in second.shared_files.items():
                             if group_id in merged_files:
                                 merged_files[group_id].extend(files)
                             else:
-                                merged_files[group_id] = files
-                        
-                        # Calculate new sizes
-                        total_shared_size = groups[i].total_shared_size + groups[j].total_shared_size
-                        wasted_space = groups[i].wasted_space + groups[j].wasted_space
-                        
-                        # Create merged group
-                        merged_group = FolderGroup(
-                            folders=merged_folders,
+                                merged_files[group_id] = list(files)
+
+                        working[i] = FolderGroup(
+                            folders=collapse(first.folders | second.folders),
                             shared_files=merged_files,
-                            total_shared_size=total_shared_size,
-                            wasted_space=wasted_space
+                            total_shared_size=first.total_shared_size + second.total_shared_size,
+                            wasted_space=first.wasted_space + second.wasted_space,
                         )
-                        
-                        # Replace groups[i] with merged group and remove groups[j]
-                        groups[i] = merged_group
-                        groups.pop(j)
-                        
+                        working.pop(j)
                         merged = True
                         break
-            
+                if merged:
+                    break
+
             if not merged:
                 break
-        
-        return sorted(groups, key=lambda x: x.total_shared_size, reverse=True)
+
+        return sorted(working, key=lambda x: x.wasted_space, reverse=True)

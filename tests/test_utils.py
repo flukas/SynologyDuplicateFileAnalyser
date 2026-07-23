@@ -7,7 +7,7 @@ import logging
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
-from src.utils import setup_logging, parse_csv_line, extract_folder_name
+from src.utils import setup_logging, parse_csv_line, extract_folder_name, containing_directory
 
 def test_parse_csv_line_basic():
     """Test parsing of a basic CSV line without quotes or special characters"""
@@ -69,6 +69,24 @@ def test_extract_folder_name_invalid():
         with pytest.raises(ValueError):
             extract_folder_name(path)
 
+def test_containing_directory_basic():
+    """Full containing directory is returned, preserving all levels"""
+    assert containing_directory('/volume1/photos/vacation/img.jpg') == '/volume1/photos/vacation'
+    assert containing_directory('/volume1/photos/img.jpg') == '/volume1/photos'
+    assert containing_directory('/volume1/测试/文件.jpg') == '/volume1/测试'
+
+def test_containing_directory_invalid():
+    """Invalid paths raise ValueError"""
+    invalid_paths = [
+        '',
+        'invalid',
+        '/volume1/onlyshare.jpg',  # no directory below the share
+        '/volume2/folder/file.jpg',  # wrong volume
+    ]
+    for path in invalid_paths:
+        with pytest.raises(ValueError):
+            containing_directory(path)
+
 def test_setup_logging(tmp_path):
     """Test logging setup and file creation"""
     log_path = tmp_path / "test.log"
@@ -76,10 +94,13 @@ def test_setup_logging(tmp_path):
     
     # Verify log file was created
     assert log_path.exists()
-    
-    # Test logging
+
+    # Logger is configured for errors only
+    assert logger.level == logging.ERROR
+
+    # Test logging (error level, since routine levels are suppressed)
     test_message = "Test log message"
-    logger.info(test_message)
+    logger.error(test_message)
         # Flush handlers to ensure content is written
     for handler in logger.handlers:
         handler.flush()
@@ -87,3 +108,13 @@ def test_setup_logging(tmp_path):
     # Verify message was written
     content = log_path.read_text()
     assert test_message in content
+
+
+def test_setup_logging_suppresses_info(tmp_path):
+    """Info-level messages must not be written when logging errors only"""
+    log_path = tmp_path / "info.log"
+    logger = setup_logging(log_path)
+    logger.info("routine detail that should be suppressed")
+    for handler in logger.handlers:
+        handler.flush()
+    assert log_path.read_text() == ""

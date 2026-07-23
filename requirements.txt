@@ -1,0 +1,7 @@
+# Runtime dependencies for the Synology Duplicate Folder Analyzer.
+#
+# The tool intentionally depends on the Python standard library only, for
+# both the analysis core and HTML integration, to keep the NAS deployment
+# dependency-free. This file is intentionally empty of packages.
+#
+# Test-only dependencies live in tests/requirements.txt.

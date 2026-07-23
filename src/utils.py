@@ -1,5 +1,11 @@
 # src/utils.py
-from typing import Tuple, Optional
+"""Shared utilities: logging setup, CSV line parsing, and path helpers.
+
+This module owns the single CSV-parsing path (``parse_csv_line``) used by the
+analyzer, plus path helpers: ``extract_folder_name`` (top-level share, for
+display) and ``containing_directory`` (full directory path, used for grouping).
+"""
+from typing import Tuple
 from pathlib import Path
 import logging
 import csv
@@ -7,8 +13,11 @@ import re
 
 def setup_logging(log_path: Path) -> logging.Logger:
     """
-    Configure logging for the application.
-    
+    Configure error-only logging for the application.
+
+    Per the specification the tool logs errors only (including each skipped
+    malformed CSV row); routine processing detail is not logged.
+
     Args:
         log_path: Path where log file should be created
     
@@ -24,8 +33,11 @@ def setup_logging(log_path: Path) -> logging.Logger:
         
         # Create logger
         logger = logging.getLogger('file_deduplication')
-        logger.setLevel(logging.INFO)
-        
+        logger.setLevel(logging.ERROR)
+
+        # Avoid duplicate handlers if called more than once
+        logger.handlers.clear()
+
         # Create handlers
         file_handler = logging.FileHandler(log_path, encoding='utf-8')
         stream_handler = logging.StreamHandler()
@@ -85,9 +97,14 @@ def parse_csv_line(line: str) -> Tuple[str, str, str, int, str]:
 
 def extract_folder_name(path: str) -> str:
     """
-    Extract the shared folder name from a full file path.
+    Extract the top-level Synology share name from a full file path.
     Example: '/volume1/photos/vacation/img.jpg' -> 'photos'
-    
+
+    Note:
+        This returns only the top-level share. Grouping and overlap analysis
+        use the full containing-directory path (see ``containing_directory``),
+        not this value. Retained for display/labelling and share-level rollups.
+
     Args:
         path: Full file path from CSV
     
@@ -107,3 +124,28 @@ def extract_folder_name(path: str) -> str:
         )
     
     return match.group(1)
+
+def containing_directory(path: str) -> str:
+    """
+    Return the full directory path that contains a file.
+    Example: '/volume1/photos/vacation/img.jpg' -> '/volume1/photos/vacation'
+
+    This is the value stored in ``DuplicateFile.folder`` and used for
+    full-hierarchy grouping and overlap detection.
+
+    Args:
+        path: Full file path from CSV
+
+    Returns:
+        Full path of the containing directory
+
+    Raises:
+        ValueError: If path format is invalid
+    """
+    # Require at least /volume1/<share>/<something>
+    if not re.match(r'^/volume1/[^/]+/', path):
+        raise ValueError(
+            f"Invalid path format: {path}. Expected /volume1/folder_name/..."
+        )
+
+    return path.rsplit('/', 1)[0]
